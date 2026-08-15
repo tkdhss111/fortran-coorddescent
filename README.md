@@ -128,9 +128,13 @@ cmake -S . -B build -G Ninja -DCMAKE_Fortran_COMPILER=ifx \
       -DCOARRAY_MODE=shared -DCOARRAY_IMAGES=4
 cmake --build build
 
-source /opt/intel/oneapi/setvars.sh      # required to RUN, not only to build
-./build/test_coord_descent
+source /opt/intel/oneapi/setvars.sh ; ./test/sweep_images.sh
 ```
+
+Note the `;`. `setvars.sh` exits 3, so `&&` short-circuits and nothing runs.
+
+Image count can be set at runtime with `FOR_COARRAY_NUM_IMAGES` without
+rebuilding.
 
 `-coarray=shared` launches images through MPI Hydra, so oneAPI must be sourced
 before running. Profile with `-coarray=single`: a shared build is already running
@@ -138,23 +142,54 @@ N images, so profiling it measures the wrong thing.
 
 ## Validation
 
-`test/test_coord_descent.f90` minimizes a quadratic with a **known** optimum on
-the simplex, deliberately sparse so the corner behaviour is exercised:
+**Run `test/sweep_images.sh`, not a single configuration.** A coarray program
+that passes at one image count proves nothing about the others. The first
+version of this module passed at 2, 3 and 4 images and was broken at 1, 6 and 8:
+
+```
+images=1   final_f = 0.456750   == the baseline; a single image searched DOWN only
+images=6   final_f = 0.316884   stalled against an unreachable incumbent
+images=8   final_f = 0.326750   same, worse
+```
+
+Both defects were invisible from the 4-image run. The second is the instructive
+one: the incumbent was taken as `min()` over every measured point, including
+speculative points the outward scan had discarded and never committed, so the
+search compared against a value the vector did not achieve. It got *worse with
+more images* — the opposite of what a parallel implementation should do — and so
+hid completely at low image counts.
+
+Current results across image counts:
+
+```
+images  rc   final_f      max|w-t|   evals   converged
+1       0    0.001488     0.025000    64     pass 3
+2       0    0.001488     0.025000    64     pass 3
+3       0    0.004036     0.033312   153     pass 6
+4       0    0.001488     0.025000   110     pass 3
+5       0    0.002349     0.028174   187     pass 5
+6       0    0.001488     0.025000   150     pass 3
+8       0    0.001488     0.025000   188     pass 3
+12      0    0.001488     0.025000   270     pass 3
+16      0    0.001488     0.025000   352     pass 3
+```
+
+Two properties to be aware of.
+
+**Reproducing a run exactly requires the same image count.** One image and every
+even count agree bit-for-bit. Odd counts differ: with `nslot` odd the down/up
+split is asymmetric (3 images gives 1 down, 2 up), a different point set is
+measured, and the flat-stop lands elsewhere. Every answer is valid and
+converged; they are not the same answer.
+
+**Total evaluations grow with image count** (64 at one image, 352 at sixteen).
+That is the cost of speculating on points a serial walk would never reach. Wall
+clock improves; total work does not. The speed-up is sublinear by construction.
+
+The objective itself:
 
 ```
 f(w) = sum_k a_k * (w_k - t_k)^2      minimized at w = t
-```
-
-Result at 8 coordinates, 4 images, delta 0.05:
-
-```
-converged at pass 9, 0 moves
-f                 0.456750 -> 0.003252
-max |w - t|       0.0341        (< one delta)
-sum(w)            1.000000      exactly
-sparse targets    recovered to exactly 0.0000
-evaluations       326
-tolerance-capped  25
 ```
 
 Give it enough passes. At `max_pass = 6` the same run stops mid-descent — still

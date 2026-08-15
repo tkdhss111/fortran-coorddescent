@@ -97,11 +97,29 @@ module coord_descent_mo
 
   ! Coarray scratch for one block of the line search. Module variables are
   ! implicitly saved, which coarrays require.
-  real(dp) :: img_val[*]
-  real(dp) :: img_pos[*]
-  integer  :: img_ok[*]
+  !
+  ! The block is defined by SLOTS, not by images: there are always at least two
+  ! slots (one down, one up), and images take ceil(nslot/nim) slots each. With
+  ! nim = 1 that single image serves both directions. Deriving the direction
+  ! straight from the image index instead gives a single-image build a downward
+  ! search only -- measured: zero improvement over the baseline.
+  real(dp), allocatable :: img_val(:)[:]
+  real(dp), allocatable :: img_pos(:)[:]
+  integer,  allocatable :: img_ok(:)[:]
 
 contains
+
+  ! Block decomposition of [n1,n2] over nprocs for 0-based irank.
+  pure subroutine para_range( n1, n2, nprocs, irank, ista, iend )
+    integer, intent(in)  :: n1, n2, nprocs, irank
+    integer, intent(out) :: ista, iend
+    integer :: chunk, extra
+    chunk = ( n2 - n1 + 1 ) / nprocs
+    extra = mod( n2 - n1 + 1, nprocs )
+    ista  = irank * chunk + n1 + min( irank, extra )
+    iend  = ista + chunk - 1
+    if ( extra > irank ) iend = iend + 1
+  end subroutine
 
   subroutine cd_init( this, w0, names, delta, tol, max_pass )
     class(cd_ty),  intent(inout) :: this
@@ -201,16 +219,20 @@ contains
 
     real(dp), allocatable :: cand(:), gv(:), gp(:)
     integer,  allocatable :: go(:)
-    real(dp) :: best, cur, avail, v, bestv, prev_d, prev_u
-    integer  :: me, nim, half, dir, step, s, pass, round, k, i, moved, evals, trunc
+    real(dp) :: best, cur, avail, v, bestv, bestf, prev_d, prev_u
+    integer  :: me, nim, nslot, nper, half, dir, step, s, pass, round, k, i, j
+    integer  :: slot, s1, s2, moved, evals, trunc
     logical  :: ok, stop_d, stop_u, improved, any_move
     character(64) :: tag
 
-    me   = this_image()
-    nim  = num_images()
-    half = max( 1, nim / 2 )      ! odd counts give the spare image to "up"
+    me    = this_image()
+    nim   = num_images()
+    nslot = max( 2, nim )         ! always at least one down and one up slot
+    half  = nslot / 2             ! odd counts give the spare slot to "up"
+    nper  = ( nslot + nim - 1 ) / nim
 
-    allocate( cand(this%n), gv(nim), gp(nim), go(nim) )
+    if ( .not. allocated( img_val ) ) allocate( img_val(nper)[*], img_pos(nper)[*], img_ok(nper)[*] )
+    allocate( cand(this%n), gv(nslot), gp(nslot), go(nslot) )
 
     best  = baseline
     evals = 0
@@ -246,58 +268,66 @@ contains
         prev_d = best
         prev_u = best
 
-        if ( me <= half ) then
-          dir  = -1
-          step = me
-        else
-          dir  = 1
-          step = me - half
-        end if
+        bestf = best
+        call para_range( 1, nslot, nim, me - 1, s1, s2 )
 
         round_loop: do round = 0, this%max_round - 1
 
-          k = round * half + step
-          v = cur + real( dir * k, dp ) * this%delta
-          v = min( max( v, 0.0_dp ), avail )
+          img_val = huge( 1.0_dp )
+          img_ok  = 0
+          img_pos = cur
 
-          ! Skip work in a direction already stopped, but keep participating in
-          ! the collectives -- every image must reach every sync all.
-          if ( ( dir == -1 .and. stop_d ) .or. ( dir == 1 .and. stop_u ) ) then
-            img_val = huge( 1.0_dp )
-            img_ok  = 0
-          else
-            call make_candidate( this, s, v, cand, ok )
-            if ( ok ) then
-              write( tag, '(a,i0,a,i0,a,i0)' ) 'p', pass, '_s', s, '_i', me
-              call obj%evaluate( cand, trim( tag ), img_val, ok )
-              img_ok = merge( 1, 0, ok )
-              evals  = evals + 1
+          do slot = s1, s2
+            j = slot - s1 + 1
+            if ( slot <= half ) then
+              dir  = -1
+              step = slot
             else
-              img_val = huge( 1.0_dp )
-              img_ok  = 0
+              dir  = 1
+              step = slot - half
             end if
-          end if
-          img_pos = v
+            k = round * max( 1, half ) + step
+            v = cur + real( dir * k, dp ) * this%delta
+            v = min( max( v, 0.0_dp ), avail )
+            img_pos(j) = v
+
+            ! Skip a direction already stopped, but STILL enter every sync all
+            ! below -- an image that skips a collective deadlocks the rest.
+            if ( ( dir == -1 .and. stop_d ) .or. ( dir == 1 .and. stop_u ) ) cycle
+
+            call make_candidate( this, s, v, cand, ok )
+            if ( .not. ok ) cycle
+            write( tag, '(a,i0,a,i0,a,i0,a,i0)' ) 'p', pass, '_s', s, '_i', me, '_j', j
+            call obj%evaluate( cand, trim( tag ), img_val(j), ok )
+            img_ok(j) = merge( 1, 0, ok )
+            evals = evals + 1
+          end do
 
           sync all
 
           if ( me == 1 ) then
             do i = 1, nim
-              gv(i) = img_val[i]
-              gp(i) = img_pos[i]
-              go(i) = img_ok[i]
+              call para_range( 1, nslot, nim, i - 1, s1, s2 )
+              do slot = s1, s2
+                j = slot - s1 + 1
+                gv(slot) = img_val(j)[i]
+                gp(slot) = img_pos(j)[i]
+                go(slot) = img_ok(j)[i]
+              end do
             end do
+            call para_range( 1, nslot, nim, me - 1, s1, s2 )
             ! Scan OUTWARD from the incumbent in each direction, applying the
             ! same rules a serial walk would. Points beyond a stop are dropped.
             call scan_direction( gv(1:half), gp(1:half), go(1:half), &
-                                 best, this%tol, prev_d, stop_d, bestv, improved, trunc )
-            call scan_direction( gv(half+1:nim), gp(half+1:nim), go(half+1:nim), &
-                                 best, this%tol, prev_u, stop_u, bestv, improved, trunc )
+                                 best, this%tol, prev_d, stop_d, bestv, bestf, improved, trunc )
+            call scan_direction( gv(half+1:nslot), gp(half+1:nslot), go(half+1:nslot), &
+                                 best, this%tol, prev_u, stop_u, bestv, bestf, improved, trunc )
           end if
 
           call co_broadcast( stop_d,   1 )
           call co_broadcast( stop_u,   1 )
           call co_broadcast( bestv,    1 )
+          call co_broadcast( bestf,    1 )
           call co_broadcast( improved, 1 )
           call co_broadcast( prev_d,   1 )
           call co_broadcast( prev_u,   1 )
@@ -312,8 +342,13 @@ contains
 
         if ( improved ) then
           moved = moved + 1
-          ! Recompute the incumbent from the value that won.
-          best = min( best, minval( gv, mask = go == 1 ) )
+          ! The incumbent must be the value measured AT bestv -- the point
+          ! actually committed to the vector. Taking min() over every measured
+          ! point instead admits speculative points the outward scan discarded,
+          ! producing an incumbent the vector does not achieve; every later
+          ! coordinate then fails to beat it and the search stalls. That defect
+          ! worsens with MORE images, so it hides at low image counts.
+          best = bestf
         end if
 
         if ( me == 1 .and. this%verbose ) then
@@ -357,13 +392,14 @@ contains
   ! continue them. Recording that is not bookkeeping: reading a tolerance-capped
   ! coordinate as "converged" is how a search silently understates a weight.
   !
-  subroutine scan_direction( vals, pos, okf, incumbent, tol, prev, stopped, bestv, improved, trunc )
+  subroutine scan_direction( vals, pos, okf, incumbent, tol, prev, stopped, bestv, bestf, improved, trunc )
     real(dp), intent(in)    :: vals(:), pos(:)
     integer,  intent(in)    :: okf(:)
     real(dp), intent(in)    :: incumbent, tol
     real(dp), intent(inout) :: prev
     logical,  intent(inout) :: stopped
     real(dp), intent(inout) :: bestv
+    real(dp), intent(inout) :: bestf     ! objective AT bestv -- the committed value
     logical,  intent(inout) :: improved
     integer,  intent(inout) :: trunc
 
@@ -378,8 +414,9 @@ contains
         return
       end if
 
-      if ( vals(i) <= incumbent - tol ) then
+      if ( vals(i) <= incumbent - tol .and. vals(i) < bestf ) then
         bestv    = pos(i)
+        bestf    = vals(i)
         improved = .true.
       end if
 
