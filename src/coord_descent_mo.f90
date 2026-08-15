@@ -79,6 +79,8 @@ module coord_descent_mo
     integer               :: truncations = 0   ! walks cut by tol, not by an optimum
     real(dp)              :: quantum     = 0.0_dp  ! observed objective resolution
     real(dp)              :: tol_used    = 0.0_dp  ! effective tol at the final incumbent
+    integer               :: redundant   = 0       ! slots skipped as duplicates
+    integer               :: max_useful_slots = 0  ! widest reachable block seen
     real(dp), allocatable :: w(:)
   end type
 
@@ -148,6 +150,10 @@ module coord_descent_mo
   end type
 
   integer, parameter :: MAX_SEEN = 256
+
+  ! Two candidate weights closer than this are the same point: evaluating both
+  ! spends an expensive call to learn nothing.
+  real(dp), parameter :: W_EPS = 1.0e-12_dp
 
   ! Coarray scratch for one block of the line search. Module variables are
   ! implicitly saved, which coarrays require.
@@ -451,7 +457,9 @@ contains
     integer,  allocatable :: go(:)
     real(dp) :: best, cur, avail, v, bestv, bestf, prev_d, prev_u, tnow
     integer  :: me, nim, nslot, nper, half, dir, step, s, pass, round, k, i, j
-    integer  :: slot, s1, s2, moved, evals, trunc, iord
+    integer  :: slot, s1, s2, moved, evals, trunc, iord, sl, m, m1, nredun, nuse
+    logical  :: dup
+    real(dp), allocatable :: vall(:)
     logical  :: ok, stop_d, stop_u, improved, any_move
     character(64) :: tag
 
@@ -462,7 +470,9 @@ contains
     nper  = ( nslot + nim - 1 ) / nim
 
     if ( .not. allocated( img_val ) ) allocate( img_val(nper)[*], img_pos(nper)[*], img_ok(nper)[*] )
-    allocate( cand(this%n), gv(nslot), gp(nslot), go(nslot) )
+    allocate( cand(this%n), gv(nslot), gp(nslot), go(nslot), vall(nslot) )
+    nredun = 0
+    nuse   = 0
 
     best  = baseline
     evals = 0
@@ -481,6 +491,19 @@ contains
         write( *, '(a,f8.4,a,es10.3)' ) '  delta = ', this%delta, '   tol = fixed ', this%tol
       end if
       write( *, '(a,f10.4)' ) '  baseline = ', baseline
+      !
+      ! Images beyond the reachable step count cannot help: their slots clamp
+      ! onto a bound and re-measure a candidate another image already has.
+      ! Say so rather than silently burning the budget.
+      !
+      nuse = 2 * max( 1, int( 1.0_dp / this%delta ) )
+      if ( nslot > nuse ) then
+        write( *, '(a,i0,a,i0,a)' ) &
+          '  NOTE ', nslot, ' slots exceeds the ~', nuse, &
+          ' steps this delta can reach across the simplex;'
+        write( *, '(a)' ) &
+          '       the excess clamps onto bounds and is skipped, not evaluated.'
+      end if
       flush( 6 )
     end if
 
@@ -529,23 +552,52 @@ contains
           img_ok  = 0
           img_pos = cur
 
+          ! Every image computes the WHOLE slot->value map. It is pure
+          ! arithmetic, and it lets each image decide locally whether its own
+          ! slot is redundant without another collective.
+          do sl = 1, nslot
+            if ( sl <= half ) then
+              vall(sl) = cur - real( round * max( 1, half ) + sl, dp ) * this%delta
+            else
+              vall(sl) = cur + real( round * max( 1, half ) + sl - half, dp ) * this%delta
+            end if
+            vall(sl) = min( max( vall(sl), this%wlo(s) ), min( this%whi(s), avail ) )
+          end do
+
           do slot = s1, s2
             j = slot - s1 + 1
-            if ( slot <= half ) then
-              dir  = -1
-              step = slot
-            else
-              dir  = 1
-              step = slot - half
-            end if
-            k = round * max( 1, half ) + step
-            v = cur + real( dir * k, dp ) * this%delta
-            v = min( max( v, this%wlo(s) ), min( this%whi(s), avail ) )
+            dir = merge( -1, 1, slot <= half )
+            v   = vall(slot)
             img_pos(j) = v
 
             ! Skip a direction already stopped, but STILL enter every sync all
             ! below -- an image that skips a collective deadlocks the rest.
             if ( ( dir == -1 .and. stop_d ) .or. ( dir == 1 .and. stop_u ) ) cycle
+
+            ! ---- redundancy guard -------------------------------------------
+            !
+            ! Beyond the reachable range every step clamps onto the same bound,
+            ! so extra images re-measure ONE candidate N times. On a
+            ! minutes-per-call objective that is the dominant waste, and it is
+            ! invisible in the output: the duplicates simply read as flat.
+            !
+            ! A slot is redundant if it repeats an earlier slot in the same
+            ! direction, or if it equals the incumbent, whose value is known.
+            dup = ( abs( v - cur ) <= W_EPS )
+            if ( .not. dup ) then
+              m1 = merge( 1, half + 1, dir == -1 )
+              do m = m1, slot - 1
+                if ( abs( vall(m) - v ) <= W_EPS ) then
+                  dup = .true.
+                  exit
+                end if
+              end do
+            end if
+            if ( dup ) then
+              nredun = nredun + 1
+              img_ok(j) = 0            ! reads as a stop; costs no evaluation
+              cycle
+            end if
 
             call make_candidate( this, s, v, cand, ok )
             if ( .not. ok ) cycle
@@ -637,6 +689,8 @@ contains
     res%passes      = pass
     res%truncations = trunc
     res%quantum     = merge( this%q_est, 0.0_dp, this%quantized )
+    res%redundant   = nredun
+    res%max_useful_slots = nuse
     res%tol_used    = this%eff_tol( best )
     allocate( res%w, source = this%w )
   end subroutine

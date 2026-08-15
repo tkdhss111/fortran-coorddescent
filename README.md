@@ -36,6 +36,45 @@ went downward and the search improved nothing.
 
 An odd slot count gives the spare slot to the upward direction.
 
+## Too many images
+
+Past the reachable range every step clamps onto the same bound, so extra images
+re-measure **one** candidate N times. On a minutes-per-call objective that is
+the dominant waste, and it is invisible in the output — the duplicates simply
+read as flat. The reachable step count per coordinate is
+
+```
+down   floor( (cur - wlo) / delta )
+up     floor( (min(whi, avail) - cur) / delta )
+```
+
+Two safeguards. Every image computes the whole slot-to-value map — pure
+arithmetic, no extra collective — and **skips** its slot if that value repeats
+an earlier slot in the same direction or equals the incumbent; a skipped slot
+is marked as a stop and costs no evaluation. And when the slot count exceeds
+what `delta` can reach across the simplex, the run says so:
+
+```
+NOTE 16 slots exceeds the ~4 steps this delta can reach across the simplex;
+     the excess clamps onto bounds and is skipped, not evaluated.
+```
+
+`cd_result_ty%redundant` reports how many slots were skipped.
+
+The effect on the same problem, same answer, same convergence:
+
+```
+             evaluations
+images   before dedup   after dedup
+4            110            79
+8            188           115
+16           352           149
+32          ~700           165
+```
+
+The cost saturates: 16 to 32 images adds 16 evaluations rather than doubling.
+Over-provisioning images can no longer burn the budget.
+
 ## Stop rules
 
 Both are required; either ends that direction.
