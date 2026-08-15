@@ -169,7 +169,11 @@ contains
     do k = 1, this%n
       if ( this%fixed(k) ) held = held + this%w(k)
     end do
-    avail = 1.0_dp - held
+    ! max(0,...) is load-bearing. If rounding ever lets `held` drift above 1,
+    ! `avail` goes negative and the clamp below inverts: min( >=0, negative )
+    ! selects the negative, so the guard that exists to keep weights
+    ! non-negative would itself produce one.
+    avail = max( 0.0_dp, 1.0_dp - held )
 
     if ( v < -1.0e-12_dp .or. v > avail + 1.0e-12_dp ) then
       ok = .false.
@@ -205,6 +209,13 @@ contains
         end if
       end if
     end do
+
+    ! Post-condition. An expensive objective must never be handed an infeasible
+    ! point: the run would look successful and the result would be meaningless.
+    if ( any( cand < -1.0e-12_dp ) .or. abs( sum( cand ) - 1.0_dp ) > 1.0e-9_dp ) then
+      ok = .false.
+      cand = this%w
+    end if
   end subroutine
 
   !
