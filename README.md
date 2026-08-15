@@ -7,9 +7,9 @@ for expensive black-box objectives (minutes per evaluation) subject to
 ## What is parallelized, and why it is exact
 
 The line search along a single coordinate is where a serial descent spends
-everything, so that is what gets distributed. With N images the lower half
-search **downward** and the upper half **upward**, each image taking a different
-number of steps:
+everything, so that is what gets distributed. Work is split into **slots** — the
+lower half search **downward**, the upper half **upward**, each slot taking a
+different number of steps — and images take `ceil(nslot/nim)` slots each:
 
 ```
 N = 4    image 1 -> cur - 1*delta      image 3 -> cur + 1*delta
@@ -29,7 +29,12 @@ If a direction needs more steps than N/2, another block runs. Images whose
 direction has already stopped still enter every `sync all` — skipping a
 collective on one image deadlocks the rest.
 
-An odd image count gives the spare image to the upward direction.
+There are always at least two slots, so a **single-image** build still searches
+both directions (it simply takes both slots itself). Deriving the direction from
+the image index instead is the bug this replaced: with one image, every step
+went downward and the search improved nothing.
+
+An odd slot count gives the spare slot to the upward direction.
 
 ## Stop rules
 
