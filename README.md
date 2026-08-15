@@ -48,18 +48,27 @@ down   floor( (cur - wlo) / delta )
 up     floor( (min(whi, avail) - cur) / delta )
 ```
 
-Two safeguards. Every image computes the whole slot-to-value map — pure
-arithmetic, no extra collective — and **skips** its slot if that value repeats
-an earlier slot in the same direction or equals the incumbent; a skipped slot
-is marked as a stop and costs no evaluation. And when the slot count exceeds
-what `delta` can reach across the simplex, the run says so:
+Every image computes the whole slot-to-value map — pure arithmetic, no extra
+collective — and **skips** its slot if that value repeats an earlier slot in the
+same direction or equals the incumbent. A skipped slot is marked as a stop, so
+it costs no evaluation and does not perturb the outward scan.
+
+Redundancy is then **measured and reported per pass**, not estimated:
 
 ```
-NOTE 16 slots exceeds the ~4 steps this delta can reach across the simplex;
-     the excess clamps onto bounds and is skipped, not evaluated.
+ 4 images     9 of  54 slots redundant (17%)   no warning -- well matched
+16 images    75 of 128 slots redundant (59%)   "fewer images would do the same work"
+32 images   171 of 224 slots redundant (76%)   same warning
 ```
 
-`cd_result_ty%redundant` reports how many slots were skipped.
+An earlier version warned at startup from a heuristic — roughly `2/delta` steps
+across the simplex. It was useless: it never fired in any case where dedup
+saved real work, because redundancy is **per-coordinate** and depends on where
+that coordinate currently sits. A coordinate at 0.02 with `delta = 0.05` has
+zero reachable down-steps, which no global rule can see. Measure it; do not
+estimate it.
+
+`cd_result_ty%redundant` reports the total.
 
 The effect on the same problem, same answer, same convergence:
 

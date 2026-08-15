@@ -458,6 +458,7 @@ contains
     real(dp) :: best, cur, avail, v, bestv, bestf, prev_d, prev_u, tnow
     integer  :: me, nim, nslot, nper, half, dir, step, s, pass, round, k, i, j
     integer  :: slot, s1, s2, moved, evals, trunc, iord, sl, m, m1, nredun, nuse
+    integer  :: nredun_pass, evals_pass
     logical  :: dup
     real(dp), allocatable :: vall(:)
     logical  :: ok, stop_d, stop_u, improved, any_move
@@ -491,26 +492,15 @@ contains
         write( *, '(a,f8.4,a,es10.3)' ) '  delta = ', this%delta, '   tol = fixed ', this%tol
       end if
       write( *, '(a,f10.4)' ) '  baseline = ', baseline
-      !
-      ! Images beyond the reachable step count cannot help: their slots clamp
-      ! onto a bound and re-measure a candidate another image already has.
-      ! Say so rather than silently burning the budget.
-      !
-      nuse = 2 * max( 1, int( 1.0_dp / this%delta ) )
-      if ( nslot > nuse ) then
-        write( *, '(a,i0,a,i0,a)' ) &
-          '  NOTE ', nslot, ' slots exceeds the ~', nuse, &
-          ' steps this delta can reach across the simplex;'
-        write( *, '(a)' ) &
-          '       the excess clamps onto bounds and is skipped, not evaluated.'
-      end if
       flush( 6 )
     end if
 
     pass_loop: do pass = 1, this%max_pass
 
-      this%fixed = .false.
-      moved = 0
+      this%fixed  = .false.
+      moved       = 0
+      nredun_pass = 0
+      evals_pass  = 0
 
       do iord = 1, this%n
         s = this%order(iord)
@@ -594,7 +584,8 @@ contains
               end do
             end if
             if ( dup ) then
-              nredun = nredun + 1
+              nredun      = nredun + 1
+              nredun_pass = nredun_pass + 1
               img_ok(j) = 0            ! reads as a stop; costs no evaluation
               cycle
             end if
@@ -605,7 +596,8 @@ contains
             call obj%evaluate( cand, trim( tag ), img_val(j), ok )
             img_ok(j) = merge( 1, 0, ok )
             if ( ok ) call this%observe( img_val(j) )
-            evals = evals + 1
+            evals      = evals + 1
+            evals_pass = evals_pass + 1
           end do
 
           sync all
@@ -671,8 +663,31 @@ contains
         end if
       end do
 
+      ! Reduce BEFORE reporting. These are per-image counters; printing image
+      ! 1's share alone understates them by roughly the image count, and the
+      ! number looks plausible enough not to question.
+      call co_sum( nredun_pass, result_image = 1 )
+      call co_sum( evals_pass,  result_image = 1 )
+
       if ( me == 1 .and. this%verbose ) then
         write( *, '(a,i0,a,i0,a,f10.4)' ) '  pass ', pass, ': ', moved, ' move(s), best ', best
+        !
+        ! Report MEASURED redundancy, not a heuristic guess.
+        !
+        ! A startup estimate based on delta and the simplex width is far too
+        ! permissive: redundancy is per-coordinate and depends on where that
+        ! coordinate currently sits. A coordinate at 0.02 with delta 0.05 has
+        ! zero reachable down-steps, which no global rule can see -- so the
+        ! heuristic stayed silent at 32 images while 162 slots were skipped.
+        !
+        if ( nredun_pass > 0 ) then
+          write( *, '(a,i0,a,i0,a)' ) &
+            '         ', nredun_pass, ' of ', nredun_pass + evals_pass, &
+            ' slots were duplicates (clamped onto a bound) and were skipped'
+          if ( nredun_pass > evals_pass ) &
+            write( *, '(a)' ) &
+              '         more than half the slots are redundant: fewer images would do the same work'
+        end if
         flush( 6 )
       end if
 
@@ -681,7 +696,13 @@ contains
       if ( .not. any_move ) exit pass_loop
     end do pass_loop
 
-    call co_sum( evals, result_image = 1 )
+    ! Both counters are per-image and must be reduced, exactly like evals.
+    ! Reporting image 1's share alone reads as zero at high image counts,
+    ! because image 1 owns the first slot and the first slot is never a
+    ! duplicate -- which makes the metric contradict the evaluation count.
+    call co_sum( evals,  result_image = 1 )
+    call co_sum( nredun, result_image = 1 )
+    call co_sum( trunc,  result_image = 1 )
 
     res%best        = best
     res%baseline    = baseline
