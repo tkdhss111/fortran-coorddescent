@@ -107,6 +107,61 @@ to an external process can give each evaluation its own working directory.
 `ok = .false.` marks a failed evaluation; the search treats it as a stop rather
 than as a good point. A crashed run must never look like an improvement.
 
+## Tolerance is automatic by default
+
+A fixed absolute tolerance cannot generalize — it is meaningless to an objective
+measured in 1e6 or 1e-9. Two things set it instead:
+
+```
+scale        tol_rel * |f|   makes the threshold unit-free
+resolution   the objective's own quantum, estimated from observed values
+```
+
+**The resolution part is the one that matters.** If the objective is recorded at
+coarse precision — printed to two decimals, counted in integers, read off an
+instrument — then a tolerance *at* the quantum makes a genuine one-quantum
+improvement indistinguishable from no change. The walk stops while still
+improving, the run terminates cleanly, and the coordinate is silently
+understated. Setting the tolerance just under the quantum resolves one quantum
+and no less.
+
+Quantization is detected properly, not guessed. A small smallest-gap does not
+imply a quantum: for a continuous objective that gap simply shrinks as more
+points are sampled, and treating it as a quantum would drive the tolerance to
+zero and disable the flat-stop entirely. The test is that **every** observed
+value lies on a multiple of the same step.
+
+```fortran
+call cd%init ( w0, names, delta = 0.05_dp )              ! automatic (default)
+call cd%init ( w0, names, delta = 0.05_dp, tol = 1.0e-4_dp )  ! explicit; auto off
+```
+
+Passing `tol` explicitly is taken as an explicit choice and disables automatic
+mode. `cd_result_ty` reports `quantum` (0 if continuous) and `tol_used`, so the
+resolution of your own objective is an output of the run.
+
+Measured behaviour (`test/test_auto_tol.f90`):
+
+```
+case                       quantum est   tol used      max|w-t|
+continuous, scale 1        0.0000E+00    4.5675E-04    0.0250
+continuous, scale 1e6      0.0000E+00    4.5675E+02    0.0250   <- identical result
+quantized 0.01, auto       1.0000E-02    5.0000E-03    0.0250
+quantized 0.01, tol=0.01   1.0000E-02    1.0000E-02    0.0250
+quantized 0.05, auto       5.0000E-02    2.5000E-02    0.1750
+quantized 0.05, tol=0.05   5.0000E-02    5.0000E-02    0.2250   <- worse
+```
+
+At quantum 0.01 a single step spans many quanta, so a fixed tolerance costs
+nothing. At quantum 0.05 the whole objective spans about nine levels,
+improvements are one or two quanta, and the fixed tolerance reads them as flat —
+it stops 0.2250 from the optimum where automatic stops at 0.1750.
+
+Note what is *not* asserted: that automatic reaches the optimum under coarse
+quantization. It cannot, and neither can anything else — the objective does not
+distinguish the weights, so demanding recovery would test the measurement rather
+than the method. The criterion is that **automatic is never worse than fixed**.
+
 ## Choosing delta
 
 `delta` is **additive**, in weight units, deliberately. A multiplicative grid
@@ -179,7 +234,22 @@ images  rc   final_f      max|w-t|   evals   converged
 16      0    0.001488     0.025000   352     pass 3
 ```
 
-Two properties to be aware of.
+**The exit code is not a pass signal.** A coarray runtime abort is flattened to
+exit status 0 — a crashed run reports success. This was not hypothetical: a
+format/variable-type mismatch introduced during development crashed every image
+and still returned 0.
+
+```
+forrtl: severe (61): format/variable-type mismatch
+In coarray image 1
+rc=0                                    <- crashed, reported success
+```
+
+`sweep_images.sh` therefore scans the output for abort signatures and for the
+convergence marker, and treats the exit code as advisory. Any harness wrapping
+a coarray binary must do the same.
+
+Two further properties to be aware of.
 
 **Reproducing a run exactly requires the same image count.** One image and every
 even count agree bit-for-bit. Odd counts differ: with `nslot` odd the down/up

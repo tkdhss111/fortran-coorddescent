@@ -19,6 +19,15 @@ printf "  images  rc   final_f      max|w-t|   evals   converged\n"
 for n in $COUNTS; do
   out=$(FOR_COARRAY_NUM_IMAGES=$n timeout 900 "$BIN" 2>&1)
   rc=$?
+  # A coarray runtime abort is flattened to exit 0 -- the exit code alone will
+  # report a crashed run as a success. Scan the output for the abort signature
+  # as well. This is not belt-and-braces: it is the only reliable signal.
+  if echo "$out" | grep -qE "forrtl: severe|Abort|SIGSEGV|SIGBUS|In coarray image"; then
+    printf "  %-7s CRASHED (exit code was %s -- coarrays flatten aborts to 0)\n" "$n" "$rc"
+    echo "$out" | grep -m1 -E "forrtl: severe|Abort|SIGSEGV|SIGBUS" | sed 's/^/      /'
+    fail=$((fail+1))
+    continue
+  fi
   final=$(echo "$out" | grep "final f"     | awk '{print $3}')
   err=$(echo   "$out" | grep "max |w - t|" | awk '{print $NF}')
   ev=$(echo    "$out" | grep "evaluations" | awk '{print $2}')

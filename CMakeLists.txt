@@ -35,3 +35,7 @@ enable_testing ()
 add_executable ( test_coord_descent test/test_coord_descent.f90 )
 target_link_libraries ( test_coord_descent PRIVATE coorddescent )
 add_test ( NAME test_coord_descent COMMAND test_coord_descent )
+
+add_executable ( test_auto_tol test/test_auto_tol.f90 )
+target_link_libraries ( test_auto_tol PRIVATE coorddescent )
+add_test ( NAME test_auto_tol COMMAND test_auto_tol )

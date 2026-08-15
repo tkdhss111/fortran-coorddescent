@@ -77,23 +77,56 @@ module coord_descent_mo
     integer               :: evaluations = 0
     integer               :: passes      = 0
     integer               :: truncations = 0   ! walks cut by tol, not by an optimum
+    real(dp)              :: quantum     = 0.0_dp  ! observed objective resolution
+    real(dp)              :: tol_used    = 0.0_dp  ! effective tol at the final incumbent
     real(dp), allocatable :: w(:)
   end type
 
   type cd_ty
     integer  :: n        = 0
     real(dp) :: delta    = 0.05_dp     ! ADDITIVE step, in weight units
-    real(dp) :: tol      = 0.01_dp     ! flat-stop threshold on the objective
+    !
+    ! TOLERANCE. An absolute tol cannot generalize -- it is meaningless to an
+    ! objective measured in 1e6 or 1e-9. Two things set it instead:
+    !
+    !   scale       tol_rel * |f| makes it unit-free
+    !   resolution  the objective's own quantum, estimated from what has
+    !               actually been observed
+    !
+    ! The second dominates. If the objective is recorded at coarse precision --
+    ! printed to two decimals, counted in integers, read off an instrument --
+    ! then a tolerance AT the quantum makes a genuine one-quantum improvement
+    ! read as flat, and the search stops early while still improving. Setting
+    ! tol just below the quantum resolves one quantum and no less.
+    !
+    ! auto_tol = .true. (default) does this. Set it .false. and tol is used
+    ! exactly as given.
+    !
+    logical  :: auto_tol = .true.
+    real(dp) :: tol_rel  = 1.0e-3_dp   ! used until the quantum is known
+    real(dp) :: tol      = 0.01_dp     ! absolute; maintained automatically if auto_tol
     integer  :: max_pass = 5
     integer  :: max_round = 8          ! blocks per direction before giving up
     logical  :: verbose  = .true.
     real(dp),      allocatable :: w(:)
     logical,       allocatable :: fixed(:)
     character(64), allocatable :: name(:)
+    ! Resolution estimate: the smallest non-zero gap between distinct observed
+    ! values. For a continuous objective this keeps shrinking and stops
+    ! mattering; for a quantized one it converges on the quantum.
+    real(dp)              :: q_est     = 0.0_dp
+    real(dp)              :: f_scale   = 0.0_dp   ! representative magnitude (the baseline)
+    logical               :: quantized = .false.
+    real(dp), allocatable :: fseen(:)
+    integer               :: nseen = 0
   contains
-    procedure :: init => cd_init
-    procedure :: run  => cd_run
+    procedure :: init       => cd_init
+    procedure :: run        => cd_run
+    procedure :: observe    => cd_observe
+    procedure :: eff_tol    => cd_eff_tol
   end type
+
+  integer, parameter :: MAX_SEEN = 256
 
   ! Coarray scratch for one block of the line search. Module variables are
   ! implicitly saved, which coarrays require.
@@ -144,9 +177,116 @@ contains
     this%w = this%w / sum( this%w )
 
     if ( present( delta ) )    this%delta    = delta
-    if ( present( tol ) )      this%tol      = tol
     if ( present( max_pass ) ) this%max_pass = max_pass
+    if ( present( tol ) ) then
+      this%tol      = tol
+      this%auto_tol = .false.      ! an explicit tol is an explicit choice
+    end if
+
+    allocate( this%fseen(MAX_SEEN) )
+    this%nseen = 0
+    this%q_est = 0.0_dp
   end subroutine
+
+  !
+  ! Record an observed objective value and update the resolution estimate.
+  !
+  ! The quantum is the smallest non-zero difference between distinct observed
+  ! values. A continuous objective drives this toward zero, at which point it
+  ! stops constraining anything; a quantized one converges on its step.
+  !
+  subroutine cd_observe( this, f )
+    class(cd_ty), intent(inout) :: this
+    real(dp),     intent(in)    :: f
+    integer  :: k
+    real(dp) :: gap
+
+    if ( .not. ( f == f ) ) return                  ! ignore NaN
+    if ( abs( f ) > 0.5_dp * huge( 1.0_dp ) ) return ! ignore the failure sentinel
+
+    do k = 1, this%nseen
+      gap = abs( f - this%fseen(k) )
+      if ( gap > 0.0_dp ) then
+        if ( this%q_est <= 0.0_dp .or. gap < this%q_est ) this%q_est = gap
+      end if
+    end do
+
+    if ( this%nseen < MAX_SEEN ) then
+      this%nseen = this%nseen + 1
+      this%fseen(this%nseen) = f
+    else
+      ! Ring: keep the most recent, so a drifting objective stays represented.
+      this%fseen(1:MAX_SEEN-1) = this%fseen(2:MAX_SEEN)
+      this%fseen(MAX_SEEN) = f
+    end if
+
+    call classify_resolution( this )
+  end subroutine
+
+  !
+  ! Decide whether the objective is genuinely QUANTIZED or merely continuous.
+  !
+  ! A small smallest-gap does not mean quantized -- for a continuous objective
+  ! that gap simply shrinks as more points are sampled, and treating it as a
+  ! quantum drives the tolerance toward zero and disables the flat-stop.
+  !
+  ! The real signature of quantization is that EVERY observed value lies on a
+  ! multiple of the same step. That is what is tested here.
+  !
+  subroutine classify_resolution( this )
+    class(cd_ty), intent(inout) :: this
+    integer  :: k, nmult
+    real(dp) :: r, dev, span
+
+    this%quantized = .false.
+    if ( this%nseen < 8 .or. this%q_est <= 0.0_dp ) return
+
+    span = maxval( this%fseen(1:this%nseen) ) - minval( this%fseen(1:this%nseen) )
+    if ( span <= 0.0_dp ) return
+
+    ! A quantum that resolves the whole span into very many levels is
+    ! indistinguishable from a continuous objective; refuse to call it quantized.
+    if ( span / this%q_est > 1.0e6_dp ) return
+
+    nmult = 0
+    do k = 1, this%nseen
+      r   = this%fseen(k) / this%q_est
+      dev = abs( r - anint( r ) )
+      if ( dev < 1.0e-6_dp ) nmult = nmult + 1
+    end do
+
+    this%quantized = ( nmult == this%nseen )
+  end subroutine
+
+  !
+  ! Effective flat-stop threshold at the current incumbent.
+  !
+  pure real(dp) function cd_eff_tol( this, fref ) result( t )
+    class(cd_ty), intent(in) :: this
+    real(dp),     intent(in) :: fref
+    real(dp) :: scale_ref
+
+    if ( .not. this%auto_tol ) then
+      t = this%tol
+      return
+    end if
+
+    if ( this%quantized ) then
+      ! Just under one quantum: a genuine one-quantum gain registers, an
+      ! identical reading is flat. Anything at or above the quantum makes the
+      ! two indistinguishable and stops the walk while it is still improving.
+      t = 0.5_dp * this%q_est
+    else
+      ! Continuous: purely relative, so the tolerance is unit-free. The
+      ! smallest gap between sampled points is NOT a quantum here -- it keeps
+      ! shrinking as more points arrive, and using it would drive the
+      ! tolerance to zero and disable the flat-stop altogether.
+      scale_ref = max( abs( fref ), abs( this%f_scale ) )
+      t = this%tol_rel * scale_ref
+    end if
+
+    if ( t <= 0.0_dp ) t = epsilon( 1.0_dp ) * max( abs( fref ), 1.0_dp )
+  end function
 
   !
   ! Withdraw-and-redistribute: coordinate s takes value v; the mass not held by
@@ -230,7 +370,7 @@ contains
 
     real(dp), allocatable :: cand(:), gv(:), gp(:)
     integer,  allocatable :: go(:)
-    real(dp) :: best, cur, avail, v, bestv, bestf, prev_d, prev_u
+    real(dp) :: best, cur, avail, v, bestv, bestf, prev_d, prev_u, tnow
     integer  :: me, nim, nslot, nper, half, dir, step, s, pass, round, k, i, j
     integer  :: slot, s1, s2, moved, evals, trunc
     logical  :: ok, stop_d, stop_u, improved, any_move
@@ -248,11 +388,19 @@ contains
     best  = baseline
     evals = 0
     trunc = 0
+    this%f_scale = abs( baseline )     ! representative magnitude for the relative tol
+    call this%observe( baseline )
 
     if ( me == 1 .and. this%verbose ) then
-      write( *, '(a,i0,a,i0,a,i0,a)' ) &
-        '  coordinate descent: ', nim, ' images (', half, ' down, ', nim - half, ' up)'
-      write( *, '(a,f8.4,a,f8.4)' ) '  delta = ', this%delta, '   tol = ', this%tol
+      write( *, '(a,i0,a,i0,a,i0,a,i0,a)' ) &
+        '  coordinate descent: ', nim, ' images, ', nslot, ' slots (', half, &
+        ' down, ', nslot - half, ' up)'
+      if ( this%auto_tol ) then
+        write( *, '(a,f8.4,a,es10.3,a)' ) '  delta = ', this%delta, &
+          '   tol = auto (rel ', this%tol_rel, ', floored at half the observed resolution)'
+      else
+        write( *, '(a,f8.4,a,es10.3)' ) '  delta = ', this%delta, '   tol = fixed ', this%tol
+      end if
       write( *, '(a,f10.4)' ) '  baseline = ', baseline
       flush( 6 )
     end if
@@ -311,6 +459,7 @@ contains
             write( tag, '(a,i0,a,i0,a,i0,a,i0)' ) 'p', pass, '_s', s, '_i', me, '_j', j
             call obj%evaluate( cand, trim( tag ), img_val(j), ok )
             img_ok(j) = merge( 1, 0, ok )
+            if ( ok ) call this%observe( img_val(j) )
             evals = evals + 1
           end do
 
@@ -329,10 +478,13 @@ contains
             call para_range( 1, nslot, nim, me - 1, s1, s2 )
             ! Scan OUTWARD from the incumbent in each direction, applying the
             ! same rules a serial walk would. Points beyond a stop are dropped.
+            ! Recomputed each block: the resolution estimate sharpens as data
+            ! arrives, and the relative part tracks the incumbent's scale.
+            tnow = this%eff_tol( best )
             call scan_direction( gv(1:half), gp(1:half), go(1:half), &
-                                 best, this%tol, prev_d, stop_d, bestv, bestf, improved, trunc )
+                                 best, tnow, prev_d, stop_d, bestv, bestf, improved, trunc )
             call scan_direction( gv(half+1:nslot), gp(half+1:nslot), go(half+1:nslot), &
-                                 best, this%tol, prev_u, stop_u, bestv, bestf, improved, trunc )
+                                 best, tnow, prev_u, stop_u, bestv, bestf, improved, trunc )
           end if
 
           call co_broadcast( stop_d,   1 )
@@ -391,6 +543,8 @@ contains
     res%evaluations = evals
     res%passes      = pass
     res%truncations = trunc
+    res%quantum     = merge( this%q_est, 0.0_dp, this%quantized )
+    res%tol_used    = this%eff_tol( best )
     allocate( res%w, source = this%w )
   end subroutine
 
