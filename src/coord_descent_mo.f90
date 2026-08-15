@@ -458,7 +458,7 @@ contains
     real(dp) :: best, cur, avail, v, bestv, bestf, prev_d, prev_u, tnow
     integer  :: me, nim, nslot, nper, half, dir, step, s, pass, round, k, i, j
     integer  :: slot, s1, s2, moved, evals, trunc, iord, sl, m, m1, nredun, nuse
-    integer  :: nredun_pass, evals_pass
+    integer  :: nredun_pass, evals_pass, evals_now
     logical  :: dup
     real(dp), allocatable :: vall(:)
     logical  :: ok, stop_d, stop_u, improved, any_move
@@ -497,7 +497,11 @@ contains
 
     pass_loop: do pass = 1, this%max_pass
 
-      this%fixed  = .false.
+      ! Frozen coordinates are fixed BEFORE the sweep begins. Marking them
+      ! only when their turn arrives leaves them unfixed until then, so earlier
+      ! coordinates redistribute INTO them and their weight changes -- the one
+      ! thing "frozen" promises will not happen.
+      this%fixed  = this%frozen
       moved       = 0
       nredun_pass = 0
       evals_pass  = 0
@@ -505,11 +509,7 @@ contains
       do iord = 1, this%n
         s = this%order(iord)
 
-        ! Frozen coordinates keep their weight and are never swept.
-        if ( this%frozen(s) ) then
-          this%fixed(s) = .true.
-          cycle
-        end if
+        if ( this%frozen(s) ) cycle       ! already fixed above
 
         ! The last unfixed coordinate is determined by the residual, not swept.
         if ( count( .not. this%fixed ) <= 1 ) then
@@ -519,9 +519,18 @@ contains
 
         ! Hard evaluation budget: stop cleanly rather than overrunning a
         ! caller who is paying minutes per evaluation.
-        if ( this%max_evals > 0 .and. evals >= this%max_evals ) then
-          this%fixed(s) = .true.
-          cycle
+        !
+        ! The count MUST be reduced first. `evals` is per-image, so testing it
+        ! locally lets image 1 skip the block loop -- and its sync all -- while
+        ! image 2 enters the barrier. Divergent control flow around a collective
+        ! is a deadlock, not a wrong answer: the run simply stops forever.
+        if ( this%max_evals > 0 ) then
+          evals_now = evals
+          call co_sum( evals_now )          ! every image gets the same total
+          if ( evals_now >= this%max_evals ) then
+            this%fixed(s) = .true.
+            cycle
+          end if
         end if
 
         cur   = this%w(s)
