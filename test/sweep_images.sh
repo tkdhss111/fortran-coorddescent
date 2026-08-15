@@ -12,6 +12,7 @@
 #
 set -uo pipefail
 BIN=${1:-./build/test_coord_descent}
+# NOTE: some suites take minutes per configuration; give them room.
 COUNTS=${2:-"1 2 3 4 5 6 8 12 16"}
 fail=0
 

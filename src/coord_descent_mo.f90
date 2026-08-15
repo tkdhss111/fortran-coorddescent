@@ -108,6 +108,27 @@ module coord_descent_mo
     integer  :: max_pass = 5
     integer  :: max_round = 8          ! blocks per direction before giving up
     logical  :: verbose  = .true.
+    !
+    ! ---- user-tunable, because each one changes the ANSWER ----------------
+    !
+    ! Sweep order. Two runs are comparable only if this is identical, and the
+    ! coordinate swept LAST is starved: earlier ones have claimed the budget.
+    ! Defaults to 1..n. Set it explicitly whenever runs will be compared.
+    integer,  allocatable :: order(:)
+    !
+    ! Hard evaluation budget. For an objective costing minutes, max_pass is not
+    ! a cost the caller can predict; evaluations are. 0 = unlimited.
+    integer  :: max_evals = 0
+    !
+    ! Per-coordinate bounds within the simplex. Defaults to [0, 1].
+    real(dp), allocatable :: wlo(:), whi(:)
+    !
+    ! Coordinates excluded from the search, keeping their initial weight.
+    logical,  allocatable :: frozen(:)
+    !
+    ! Fraction of the detected quantum used as the flat-stop threshold.
+    ! Must be < 1, or a genuine one-quantum gain reads as no change.
+    real(dp) :: quantum_frac = 0.5_dp
     real(dp),      allocatable :: w(:)
     logical,       allocatable :: fixed(:)
     character(64), allocatable :: name(:)
@@ -186,6 +207,64 @@ contains
     allocate( this%fseen(MAX_SEEN) )
     this%nseen = 0
     this%q_est = 0.0_dp
+
+    ! Defaults for the tunables the caller did not set.
+    if ( .not. allocated( this%order ) ) then
+      allocate( this%order(this%n) )
+      do k = 1, this%n
+        this%order(k) = k
+      end do
+    end if
+    if ( .not. allocated( this%wlo ) )    allocate( this%wlo(this%n),    source = 0.0_dp )
+    if ( .not. allocated( this%whi ) )    allocate( this%whi(this%n),    source = 1.0_dp )
+    if ( .not. allocated( this%frozen ) ) allocate( this%frozen(this%n), source = .false. )
+
+    call cd_validate( this )
+  end subroutine
+
+  !
+  ! Validate the configuration and STOP on anything wrong.
+  !
+  ! Silently clamping a bad parameter is worse than refusing it: the run
+  ! completes, the numbers look reasonable, and the caller never learns that
+  ! what executed was not what they asked for.
+  !
+  subroutine cd_validate( this )
+    class(cd_ty), intent(inout) :: this
+    integer :: k
+    logical, allocatable :: hit(:)
+
+    if ( this%delta <= 0.0_dp ) error stop 'cd: delta must be positive'
+    if ( this%max_pass < 1 )    error stop 'cd: max_pass must be at least 1'
+    if ( this%max_evals < 0 )   error stop 'cd: max_evals must be >= 0 (0 = unlimited)'
+    if ( this%tol_rel <= 0.0_dp ) error stop 'cd: tol_rel must be positive'
+    if ( this%quantum_frac <= 0.0_dp .or. this%quantum_frac >= 1.0_dp ) &
+      error stop 'cd: quantum_frac must be in (0,1) -- at 1 a one-quantum gain reads as flat'
+    if ( .not. this%auto_tol .and. this%tol <= 0.0_dp ) &
+      error stop 'cd: an explicit tol must be positive'
+
+    if ( size( this%order ) /= this%n ) error stop 'cd: order has the wrong length'
+    allocate( hit(this%n), source = .false. )
+    do k = 1, this%n
+      if ( this%order(k) < 1 .or. this%order(k) > this%n ) error stop 'cd: order index out of range'
+      if ( hit(this%order(k)) ) error stop 'cd: order repeats a coordinate'
+      hit(this%order(k)) = .true.
+    end do
+    if ( .not. all( hit ) ) error stop 'cd: order omits a coordinate'
+
+    if ( size( this%wlo ) /= this%n .or. size( this%whi ) /= this%n ) &
+      error stop 'cd: wlo/whi have the wrong length'
+    if ( any( this%wlo < 0.0_dp ) )        error stop 'cd: wlo must be >= 0'
+    if ( any( this%whi > 1.0_dp ) )        error stop 'cd: whi must be <= 1'
+    if ( any( this%whi < this%wlo ) )      error stop 'cd: whi must be >= wlo'
+    if ( sum( this%wlo ) > 1.0_dp + 1.0e-12_dp ) &
+      error stop 'cd: sum(wlo) exceeds 1 -- the feasible set is empty'
+    if ( sum( this%whi ) < 1.0_dp - 1.0e-12_dp ) &
+      error stop 'cd: sum(whi) is below 1 -- the feasible set is empty'
+
+    if ( size( this%frozen ) /= this%n ) error stop 'cd: frozen has the wrong length'
+    if ( count( .not. this%frozen ) < 2 ) &
+      error stop 'cd: at least two coordinates must be free to search'
   end subroutine
 
   !
@@ -275,7 +354,7 @@ contains
       ! Just under one quantum: a genuine one-quantum gain registers, an
       ! identical reading is flat. Anything at or above the quantum makes the
       ! two indistinguishable and stops the walk while it is still improving.
-      t = 0.5_dp * this%q_est
+      t = this%quantum_frac * this%q_est
     else
       ! Continuous: purely relative, so the tolerance is unit-free. The
       ! smallest gap between sampled points is NOT a quantum here -- it keeps
@@ -372,7 +451,7 @@ contains
     integer,  allocatable :: go(:)
     real(dp) :: best, cur, avail, v, bestv, bestf, prev_d, prev_u, tnow
     integer  :: me, nim, nslot, nper, half, dir, step, s, pass, round, k, i, j
-    integer  :: slot, s1, s2, moved, evals, trunc
+    integer  :: slot, s1, s2, moved, evals, trunc, iord
     logical  :: ok, stop_d, stop_u, improved, any_move
     character(64) :: tag
 
@@ -410,10 +489,24 @@ contains
       this%fixed = .false.
       moved = 0
 
-      do s = 1, this%n
+      do iord = 1, this%n
+        s = this%order(iord)
+
+        ! Frozen coordinates keep their weight and are never swept.
+        if ( this%frozen(s) ) then
+          this%fixed(s) = .true.
+          cycle
+        end if
 
         ! The last unfixed coordinate is determined by the residual, not swept.
         if ( count( .not. this%fixed ) <= 1 ) then
+          this%fixed(s) = .true.
+          cycle
+        end if
+
+        ! Hard evaluation budget: stop cleanly rather than overrunning a
+        ! caller who is paying minutes per evaluation.
+        if ( this%max_evals > 0 .and. evals >= this%max_evals ) then
           this%fixed(s) = .true.
           cycle
         end if
@@ -447,7 +540,7 @@ contains
             end if
             k = round * max( 1, half ) + step
             v = cur + real( dir * k, dp ) * this%delta
-            v = min( max( v, 0.0_dp ), avail )
+            v = min( max( v, this%wlo(s) ), min( this%whi(s), avail ) )
             img_pos(j) = v
 
             ! Skip a direction already stopped, but STILL enter every sync all

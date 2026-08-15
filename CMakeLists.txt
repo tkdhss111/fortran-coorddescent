@@ -36,6 +36,19 @@ add_executable ( test_coord_descent test/test_coord_descent.f90 )
 target_link_libraries ( test_coord_descent PRIVATE coorddescent )
 add_test ( NAME test_coord_descent COMMAND test_coord_descent )
 
+# Shared test objective, compiled once: two targets writing the same .mod into
+# one module directory is a ninja conflict, not just wasted work.
+add_library ( testobj STATIC test/scaled_obj_mo.f90 )
+target_link_libraries ( testobj PUBLIC coorddescent )
+
 add_executable ( test_auto_tol test/test_auto_tol.f90 )
-target_link_libraries ( test_auto_tol PRIVATE coorddescent )
+target_link_libraries ( test_auto_tol PRIVATE testobj )
 add_test ( NAME test_auto_tol COMMAND test_auto_tol )
+
+add_executable ( test_tuning test/test_tuning.f90 )
+target_link_libraries ( test_tuning PRIVATE testobj )
+add_test ( NAME test_tuning COMMAND test_tuning )
+
+add_executable ( test_edge test/test_edge.f90 )
+target_link_libraries ( test_edge PRIVATE coorddescent )
+add_test ( NAME test_edge COMMAND test_edge )
