@@ -4,6 +4,77 @@ Simplex-constrained coordinate descent with a **coarray-parallel line search** â
 for expensive black-box objectives (minutes per evaluation) subject to
 `sum(w) = 1, w >= 0`.
 
+## How it works
+
+### Control flow
+
+```mermaid
+flowchart TD
+  INIT["init<br/>normalize w, validate every tunable"] --> PASS
+
+  PASS{"pass = 1 .. max_pass"} --> UNFIX["unfix all coordinates<br/>starved ones get another chance"]
+  UNFIX --> COORD{"for s in order(:)"}
+
+  COORD -->|"frozen, or last unfixed,<br/>or max_evals reached"| SKIP["fix s at its current value"]
+  SKIP --> COORD
+
+  COORD -->|searchable| AVAIL["avail = 1 - mass held by fixed<br/>bestf = incumbent"]
+  AVAIL --> BLOCK{"round = 0, 1, 2 ..."}
+  BLOCK --> SLOTS["parallel line search<br/>(see below)"]
+  SLOTS --> SCAN["image 1 scans OUTWARD from<br/>the incumbent, applying the stop rules"]
+  SCAN --> BCAST["co_broadcast stop_d, stop_u,<br/>bestv, bestf, improved"]
+  BCAST -->|"both directions stopped"| COMMIT
+  BCAST -->|"still walking"| BLOCK
+
+  COMMIT["commit: s := bestv,<br/>redistribute, fix s"] --> COORD
+  COORD -->|all coordinates fixed| ENDPASS["report moves + measured redundancy"]
+  ENDPASS -->|"moved > 0"| PASS
+  ENDPASS -->|"0 moves"| DONE["converged"]
+  PASS -->|"pass limit hit"| STOPPED["stopped, NOT converged<br/>check the move count"]
+```
+
+The distinction at the bottom matters: **`0 moves` is convergence; hitting
+`max_pass` is not.** The final vector looks the same either way, and only the
+move count on the last pass tells them apart.
+
+### The parallel line search
+
+This is the part that is distributed, and the only part that touches coarrays.
+
+```mermaid
+flowchart TD
+  MAP["every image computes the WHOLE<br/>slot to value map (pure arithmetic)"] --> SPLIT
+
+  SPLIT["para_range: image i takes<br/>ceil(nslot/nim) slots"] --> DOWN
+  SPLIT --> UP
+
+  DOWN["slots 1 .. half<br/>v = cur - k*delta"] --> CLAMP
+  UP["slots half+1 .. nslot<br/>v = cur + k*delta"] --> CLAMP
+
+  CLAMP["clamp v into<br/>[wlo(s), min(whi(s), avail)]"] --> DUP
+
+  DUP{"duplicate?<br/>repeats an earlier slot in this<br/>direction, or equals the incumbent"}
+  DUP -->|yes| SKIPEVAL["mark as a stop<br/>NO evaluation spent"]
+  DUP -->|no| EVAL["make_candidate + objective<br/>(the expensive call)"]
+
+  SKIPEVAL --> SYNC
+  EVAL --> SYNC
+
+  SYNC["sync all<br/>EVERY image arrives, including<br/>those whose direction has stopped"] --> GATHER
+  GATHER["image 1 gathers img_val, img_pos, img_ok<br/>from all images"] --> OUT["scan outward, discard<br/>anything past a stop"]
+```
+
+Two invariants worth stating explicitly, because violating either is silent:
+
+**Every image must reach every `sync all`.** An image that skips a collective
+because its direction has already stopped deadlocks the rest. That is why a
+stopped direction still enters the barrier and simply contributes nothing.
+
+**Speculation costs evaluations, never correctness.** The stop rules depend on
+the *ordering* of the points, not on the order they were measured, so scanning
+outward afterwards reproduces the serial walk exactly and discards whatever lay
+beyond a stop.
+
 ## What is parallelized, and why it is exact
 
 The line search along a single coordinate is where a serial descent spends
